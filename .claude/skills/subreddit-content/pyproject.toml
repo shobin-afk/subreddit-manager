@@ -1,0 +1,15 @@
+[project]
+name = "subreddit-content-skill"
+version = "0.1.0"
+description = "IgniteFirst subreddit content-sourcing workflow — weekly post ideation + media"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

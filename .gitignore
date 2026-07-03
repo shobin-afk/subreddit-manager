@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+# skill run artifacts (never commit sourced media / dedup history)
+.history/
+*-r-*-20*/
