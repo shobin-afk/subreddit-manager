@@ -1,11 +1,11 @@
 ---
 name: subreddit-content
-description: Weekly content-sourcing workflow for a subreddit you manage. Given one subreddit URL and its niche, discovers fresh content across YouTube, TikTok, Instagram, Pinterest, news, and blogs (never Reddit), shortlists ~15 post ideas at a balanced media/text/news mix, downloads media files for native Reddit uploads, and writes a per-post folder deliverable (post-NN/post.md + media) with weekly dedup. Deliverable-only — never auto-posts. Use when the user gives a subreddit URL + niche and asks to source, ideate, draft, or fill weekly content for a sub they run.
+description: Weekly content-sourcing workflow for a subreddit you manage. Given one subreddit URL and its niche, discovers fresh content across YouTube, TikTok, Instagram, Pinterest, news, and blogs (never Reddit), shortlists ~15 post ideas at a media/text mix, downloads media files for native Reddit uploads, and writes a per-post folder deliverable (post-NN/post.md + media) with weekly dedup. Deliverable-only — never auto-posts. Use when the user gives a subreddit URL + niche and asks to source, ideate, draft, or fill weekly content for a sub they run.
 ---
 
 # /subreddit-content
 
-You orchestrate a five-phase content-sourcing pipeline for **one** subreddit the operator manages. You produce a review-ready deliverable; you NEVER post to Reddit.
+You orchestrate a six-phase content-sourcing pipeline for **one** subreddit the operator manages. You produce a review-ready deliverable; you NEVER post to Reddit.
 
 Skill scripts live at `~/.claude/skills/subreddit-content/scripts/` (use the absolute install path). All output is written into CWD.
 
@@ -13,65 +13,55 @@ Skill scripts live at `~/.claude/skills/subreddit-content/scripts/` (use the abs
 
 | Phase | Does | Key tools |
 | --- | --- | --- |
-| 0 | Parse input, read sub rules/flairs, load history | input_parser.py, Apify reddit-scraper, history.py |
-| 1 | Wide discovery across platforms (drop Reddit + history) | `last30days` skill |
-| 2 | Score, assign type, bucket-fill shortlist → review gate | scoring.py, shortlist.py |
-| 3 | Download + validate media for the shortlist | `video-downloader` skill, media_validate.py |
-| 4 | Assemble per-post folders + summary, append history | assemble.py, history.py |
+| 0 | Parse input (+ --seeds, mix 10/5, media floor), read sub rules/flairs, load history | input_parser.py, Apify reddit-scraper, history.py |
+| 1 | Keyword seeding + DataForSEO expansion → query set | subreddit-content-keywords agent |
+| 2 | Parallel per-platform discovery + gap-fill loop | subreddit-content-discovery agents, discovery_gaps.py, shorts_filter.py |
+| 3 | Score, type, media-floor shortlist → review gate | scoring.py, shortlist.py |
+| 4 | Download + validate media for the shortlist | video-downloader skill, media_validate.py |
+| 5 | Assemble per-post folders + summary, append history | assemble.py, history.py |
 
 ## Phase 0 — Intake + guardrails
 
-1. Parse the invocation:
+1. Parse the invocation (now supports `--seeds "a, b, c"`, `--max-queries`, `--max-rounds`, `--media-floor img,vid`; default mix is `media=10, text=5`):
    ```bash
-   python3 ~/.claude/skills/subreddit-content/scripts/input_parser.py <subreddit-url> "<niche>" [--count N] [--mix media=7,text=5,news=3] [--days 30] [--auto]
+   python3 ~/.claude/skills/subreddit-content/scripts/input_parser.py <subreddit-url> "<niche>" [flags]
    ```
-   If it exits non-zero, surface the error verbatim and stop. Capture the JSON config (`subreddit_name`, `subreddit_slug`, `niche`, `count`, `mix`, `days`, `auto`).
-2. Confirm CWD is writable:
-   ```bash
-   touch .subreddit-content-permission-check && rm .subreddit-content-permission-check
-   ```
-3. Read the target subreddit's sidebar/rules/flairs via `mcp__apify__harshmaur--reddit-scraper` (fetch the sub URL). Capture: allowed post types, NSFW policy, self-promo rules, the **exact flair list**. If the scraper errors, log it and continue with an empty flair list (flairs become optional).
-4. Load history: read `.history/r-<subreddit_slug>.jsonl` via `history.load_used`. If absent, start empty.
-5. Create the run folder now — all inputs it needs (niche, subreddit_name, today's date) are already known: `assemble.run_folder_name(niche, subreddit_name, today)`, created under CWD.
-6. Write `run-config.json` (the parsed config + resolved flair list + today's date) **into the run folder** and log start:
-   ```bash
-   python3 ~/.claude/skills/subreddit-content/scripts/run_log.py run.log phase=intake event=ok sub=<slug> count=<count>
-   ```
-7. Announce: sub, niche, target count + mix, freshness window, how many history URLs will be skipped. Then start Phase 1.
+   Non-zero exit → surface verbatim and stop. Capture the config (adds `seeds`, `max_queries`, `max_rounds`, `media_floor`).
+2. Confirm CWD writable (`touch`/`rm` a probe file).
+3. **Parallel kickoff** — in a SINGLE message, both:
+   - fetch the target subreddit sidebar/rules/flairs via `mcp__apify__harshmaur--reddit-scraper`. Capture: allowed post types, NSFW policy, self-promo rules, and the exact flair list. If the scraper errors, log it and continue with an empty flair list (flairs become optional) — non-fatal.
+   - dispatch the `subreddit-content-keywords` agent (Phase 1).
+   They are independent (rules feed drafting in Phase 3; keywords feed discovery), so they run concurrently.
+4. Load history via `history.load_used(.history/r-<slug>.jsonl)`.
+5. Create the run folder now via `assemble.run_folder_name(niche, subreddit_name, today)`; write `run-config.json` into it. Log start via `run_log.py`.
+6. Announce sub, niche, count + mix (10/5), media floor, window, history-skip count.
 
-## Phase 1 — Discovery (wide, cheap)
+## Phase 1 — Keyword expansion (agent)
 
-1. Invoke the **`last30days`** skill with the niche keywords (and 2–4 obvious niche synonyms) to pull fresh posts across YouTube, TikTok, Instagram, Pinterest, news, and the web within the `days` window.
-2. **Drop every Reddit-sourced item** — discovery must not surface other subreddits' content.
-3. Normalize each candidate to: `{title, post_type_hint, source_platform, url, engagement, date (YYYY-MM-DD), thumbnail}`. `post_type_hint` ∈ {video, image, text, link}.
-4. Filter against history with `history.filter_unused`.
-5. Write `candidates.json`. If a platform errored, continue with the rest and log the gap (partial is fine, never fatal). If **zero** candidates survive, surface that (likely too-narrow niche or everything already used) and offer: widen synonyms / increase `--days` / abort.
+Handled by the `subreddit-content-keywords` agent dispatched in Phase 0's parallel kickoff. When it returns, read `keywords.json` (`query_set`, `platform_queries`, `broad_queries`). If it degraded to seeds-only (DataForSEO failure), note it for RUN-SUMMARY. Do not gate — proceed straight to discovery.
 
-## Phase 2 — Score, type, shortlist
+## Phase 2 — Discovery (parallel fan-out + gap-fill loop)
 
-1. For each candidate, judge and attach:
-   - `relevance` (0..1) — how on-topic for this niche + this specific sub.
-   - `hook` (0..1) — curiosity / humor / mild-controversy pull ("makes you click").
-   - `post_type` — final type: `video`/`image` (has downloadable media), `text` (discussion prompt grounded in a trend), or `link` (news/blog).
-2. Score:
-   ```bash
-   python3 - <<'PY'
-   # illustrative: call scoring.score_all over candidates.json with today + days
-   PY
-   ```
-   Use `scoring.score_all(candidates, today=<date>, days=<days>)`, then `shortlist.build_shortlist(scored, mix, count)`.
-3. Draft, for each shortlisted idea, a Reddit `title` (≤300 chars) and `body`:
-   - media/link → 2–4 sentence caption/framing + a credit line naming the creator.
-   - text → a full discussion prompt, grounded in a real discovered trend (never invented).
-   - Set `suggested_flair` only from the sub's real flair list (else empty). Respect the sub's rules (NSFW, self-promo).
-4. Write `shortlist.json`. **Review gate** (unless `--auto`): present the shortlist as a table (#, type, platform, title, score, source) via `AskUserQuestion`:
-   - `Approve — download media + assemble`
-   - `Edit — I'll adjust shortlist.json, then continue`
-   - `Re-shortlist with different mix/count`
-   - `Abort`
-   In `--auto`, print the table and proceed.
+1. **Fan out** — the moment `keywords.json` is available, dispatch the four `subreddit-content-discovery` agents **in a single message** (platforms: `tiktok`, `instagram`, `pinterest`, `youtube`) so they run concurrently. Pass each: platform, `platform_queries` (fallback `query_set`), `days`, `history_path`.
+2. **Merge** each agent's `candidates.<platform>.json` into one pool (the agents already history-filtered + deduped within platform; dedup across platforms with `history.normalize_url`).
+3. **Analyze gaps** with `discovery_gaps.analyze_pool(pool, count=<count>, min_images=<floor.min_images>, min_videos=<floor.min_videos>, media_total=<mix['media']>)`.
+4. **Escalation ladder** — while `not satisfied` and rounds used `< max_rounds`, climb one rung per round, then re-dispatch ONLY `gaps["platforms"]` (in parallel) with the round's queries; re-merge; re-analyze:
+   1. gap-fill: targeted re-queries for the missing floor categories.
+   2. deepen: use `broad_queries` (more DataForSEO terms).
+   3. relax freshness: widen `days` for this round.
+   4. adjacent: Claude-generated adjacent-niche terms.
+5. Stop when satisfied or `max_rounds` reached. Any residual `need_count` is filled with **text** posts in Phase 3. Record, per post, which ladder rung sourced it (for RUN-SUMMARY).
 
-## Phase 3 — Media fetch (shortlist only)
+## Phase 3 — Score, type, media-floor shortlist
+
+1. For each candidate attach `relevance` (0..1), `hook` (0..1), and finalize `post_type`.
+2. **Text backfill (discharges the ≥`count` guarantee before shortlisting):** If, after the escalation ladder, the deduped pool has fewer than `count` items, draft synthetic **text-discussion** posts (post_type=text) grounded in the `query_set` / discovered trends — enough to bring the pool to `count`. These are real discussion prompts tied to the niche, never invented filler. Mark each in RUN-SUMMARY with ladder rung `text backfill`. Add these to the pool before scoring — this is the step that actually performs the backfill Phase 2 only promised.
+3. `scoring.score_all(pool, today=<date>, days=<days>)` then
+   `shortlist.build_shortlist(scored, mix, count, floor=<media_floor>)` — the floor guarantees ≥1 image AND ≥1 video from the discovered (non-backfill) candidates. Because step 2 already brought the pool to ≥`count`, `build_shortlist` has enough items to reach `count`; the media floor is a separate, best-effort guarantee — if discovery genuinely surfaced zero images or zero videos across the whole run, select what exists and mark the shortfall in RUN-SUMMARY rather than failing the run.
+4. Draft `title` (≤300) + `body` per post (media/link → caption + credit; text → discussion prompt grounded in a real trend). `suggested_flair` only from the sub's real flairs. Respect the sub's rules captured in Phase 0 (NSFW policy, self-promo limits); set `nsfw` accordingly and never draft a post that violates them.
+5. Write `shortlist.json`. **Review gate** (unless `--auto`): show the table (#, type, platform, title, score, source, ladder-rung) via `AskUserQuestion` [Approve / Edit / Re-shortlist / Abort]. `--auto` prints + proceeds.
+
+## Phase 4 — Media fetch (shortlist only)
 
 For each post with `post_type` in {video, image}:
 1. **video:** invoke the `video-downloader` skill on `source_url` (yt-dlp). **image:** fetch directly.
@@ -83,7 +73,7 @@ For each post with `post_type` in {video, image}:
    If `media_failed`: set the post's `status: media_failed`, keep `source_url` (operator can link-post manually), and log the reason. Never hard-stop the run for one failed download.
 Text/link posts: no download.
 
-## Phase 4 — Assemble + record
+## Phase 5 — Assemble + record
 
 1. The run folder was already created in Phase 0 (`assemble.run_folder_name(niche, subreddit_name, today)`); reuse that same path — do not recreate it.
 2. For each post: `assemble.write_post(run_dir, post, allowed_flairs=<flair list>)`, then move its validated media file into `post-NN/`. On `AssembleError`, fix the offending field (title length / missing key) and retry that post.
@@ -93,8 +83,8 @@ Text/link posts: no download.
 
 ## Run mode
 
-- **default (review):** stop at the Phase 2 gate via `AskUserQuestion`.
-- **--auto:** skip the gate; still hard-stop on zero candidates or a non-writable CWD.
+- **default (review):** stop at the Phase 3 gate via `AskUserQuestion`.
+- **--auto:** skip the gate; still hard-stop on zero candidates, a non-writable CWD, or (after Phase 3's text backfill) a shortlist that is still below `count` — never let `--auto` finish under-count silently.
 
 ## Error envelope
 

@@ -9,8 +9,8 @@ from input_parser import (
 )
 
 
-def test_default_mix_15_is_7_5_3():
-    assert default_mix(15) == {"media": 7, "text": 5, "news": 3}
+def test_default_mix_15_is_10_5_0():
+    assert default_mix(15) == {"media": 10, "text": 5, "news": 0}
 
 
 def test_default_mix_sums_to_count():
@@ -34,9 +34,13 @@ def test_parse_invocation_minimal():
     assert cfg["subreddit_slug"] == "backyardchickens"
     assert cfg["niche"] == "backyard chickens"
     assert cfg["count"] == 15
-    assert cfg["mix"] == {"media": 7, "text": 5, "news": 3}
+    assert cfg["mix"] == {"media": 10, "text": 5, "news": 0}
     assert cfg["days"] == 30
     assert cfg["auto"] is False
+    assert cfg["seeds"] == []
+    assert cfg["max_queries"] == 40
+    assert cfg["max_rounds"] == 3
+    assert cfg["media_floor"] == {"min_images": 1, "min_videos": 1}
 
 
 def test_parse_invocation_flags():
@@ -70,3 +74,29 @@ def test_empty_niche_raises():
 def test_parse_mix_rejects_negative_bucket():
     with pytest.raises(InputError):
         parse_mix("media=-3,text=10,news=8")
+
+
+def test_seeds_flag_splits_on_comma():
+    cfg = parse_invocation(["reddit.com/r/foo", "niche", "--seeds", "a, b ,c"])
+    assert cfg["seeds"] == ["a", "b", "c"]
+
+
+def test_max_queries_and_rounds_flags():
+    cfg = parse_invocation(["reddit.com/r/foo", "n", "--max-queries", "20", "--max-rounds", "5"])
+    assert cfg["max_queries"] == 20
+    assert cfg["max_rounds"] == 5
+
+
+def test_media_floor_flag_parses_two_ints():
+    cfg = parse_invocation(["reddit.com/r/foo", "n", "--media-floor", "2,3"])
+    assert cfg["media_floor"] == {"min_images": 2, "min_videos": 3}
+
+
+def test_media_floor_bad_format_raises():
+    with pytest.raises(InputError):
+        parse_invocation(["reddit.com/r/foo", "n", "--media-floor", "2"])
+
+
+def test_max_queries_out_of_range_raises():
+    with pytest.raises(InputError):
+        parse_invocation(["reddit.com/r/foo", "n", "--max-queries", "0"])

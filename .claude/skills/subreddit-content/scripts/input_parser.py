@@ -11,7 +11,13 @@ DEFAULT_COUNT = 15
 DEFAULT_DAYS = 30
 COUNT_MIN, COUNT_MAX = 1, 50
 DAYS_MIN, DAYS_MAX = 1, 90
-_MIX_RATIO = {"media": 7, "text": 5, "news": 3}  # sums to 15
+_MIX_RATIO = {"media": 10, "text": 5, "news": 0}  # sums to 15
+DEFAULT_MAX_QUERIES = 40
+DEFAULT_MAX_ROUNDS = 3
+MIN_IMAGES = 1
+MIN_VIDEOS = 1
+MAX_QUERIES_MIN, MAX_QUERIES_MAX = 1, 200
+MAX_ROUNDS_MIN, MAX_ROUNDS_MAX = 1, 10
 
 _SUBREDDIT_RE = re.compile(r"reddit\.com/r/(?P<name>[A-Za-z0-9_]+)", re.IGNORECASE)
 
@@ -21,7 +27,7 @@ class InputError(ValueError):
 
 
 def default_mix(count: int) -> dict[str, int]:
-    """Split *count* across buckets at the 7:5:3 ratio, summing to count."""
+    """Split *count* across buckets at the 10:5:0 ratio, summing to count."""
     total = sum(_MIX_RATIO.values())
     out = {k: (count * v) // total for k, v in _MIX_RATIO.items()}
     # distribute the remainder to media, then text, then news
@@ -61,6 +67,20 @@ def parse_mix(spec: str) -> dict[str, int]:
     return out
 
 
+def _parse_media_floor(spec: str) -> dict[str, int]:
+    """Parse ``2,3`` into ``{"min_images": 2, "min_videos": 3}``."""
+    parts = [p.strip() for p in spec.split(",")]
+    if len(parts) != 2:
+        raise InputError(f"--media-floor expects 'images,videos', got {spec!r}")
+    try:
+        imgs, vids = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise InputError(f"--media-floor values must be ints, got {spec!r}")
+    if imgs < 0 or vids < 0:
+        raise InputError(f"--media-floor values must be >= 0, got {spec!r}")
+    return {"min_images": imgs, "min_videos": vids}
+
+
 def parse_invocation(argv: list[str]) -> dict[str, Any]:
     """Parse positional URL + niche and optional flags into a config dict."""
     positional: list[str] = []
@@ -68,6 +88,10 @@ def parse_invocation(argv: list[str]) -> dict[str, Any]:
     mix = None
     days = DEFAULT_DAYS
     auto = False
+    seeds: list[str] = []
+    max_queries = DEFAULT_MAX_QUERIES
+    max_rounds = DEFAULT_MAX_ROUNDS
+    media_floor = {"min_images": MIN_IMAGES, "min_videos": MIN_VIDEOS}
 
     i = 0
     while i < len(argv):
@@ -84,6 +108,19 @@ def parse_invocation(argv: list[str]) -> dict[str, Any]:
         elif tok == "--auto":
             auto = True
             i += 1
+        elif tok == "--seeds":
+            raw = _str_flag(argv, i, "--seeds")
+            seeds = [s.strip() for s in raw.split(",") if s.strip()]
+            i += 2
+        elif tok == "--max-queries":
+            max_queries = _int_flag(argv, i, "--max-queries")
+            i += 2
+        elif tok == "--max-rounds":
+            max_rounds = _int_flag(argv, i, "--max-rounds")
+            i += 2
+        elif tok == "--media-floor":
+            media_floor = _parse_media_floor(_str_flag(argv, i, "--media-floor"))
+            i += 2
         elif tok.startswith("--"):
             raise InputError(f"unknown flag {tok!r}")
         else:
@@ -112,6 +149,10 @@ def parse_invocation(argv: list[str]) -> dict[str, Any]:
         mix = default_mix(count)
     if not (DAYS_MIN <= days <= DAYS_MAX):
         raise InputError(f"days {days} out of range [{DAYS_MIN},{DAYS_MAX}]")
+    if not (MAX_QUERIES_MIN <= max_queries <= MAX_QUERIES_MAX):
+        raise InputError(f"max_queries {max_queries} out of range [{MAX_QUERIES_MIN},{MAX_QUERIES_MAX}]")
+    if not (MAX_ROUNDS_MIN <= max_rounds <= MAX_ROUNDS_MAX):
+        raise InputError(f"max_rounds {max_rounds} out of range [{MAX_ROUNDS_MIN},{MAX_ROUNDS_MAX}]")
 
     return {
         "subreddit_url": url,
@@ -122,6 +163,10 @@ def parse_invocation(argv: list[str]) -> dict[str, Any]:
         "mix": mix,
         "days": days,
         "auto": auto,
+        "seeds": seeds,
+        "max_queries": max_queries,
+        "max_rounds": max_rounds,
+        "media_floor": media_floor,
     }
 
 
